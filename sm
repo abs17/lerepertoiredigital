@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# ./sm — AGTK : Scrum Master dispatcher (Agentic SDLC), version générique.
+#
+# Tout ce qui est spécifique à un projet vit dans .sm/config.sh (non versionné).
+# Ce script, lui, est réutilisable tel quel d'un projet à l'autre.
+#
+# Usage:
+#   ./sm setup-labels                 # crée/met à jour les labels GitHub
+#   ./sm list                         # issues prêtes à être prises
+#   ./sm run <issue#> [--yes]         # implémente + ouvre PR + lance review (--yes : skip confirmation push)
+#   ./sm review <pr#>                 # (re)lance la review (reviewer) sur une PR
+#   ./sm promote                      # merge base → prod + deploy ($DEPLOY_CMD)
+#   ./sm bug <issue-source#> "<desc>" # ouvre une issue de bug liée
+#   ./sm status <issue#>              # affiche la timeline d'une US
+#   ./sm logs [--tail|<issue#>|<pr#>] # observabilité : liste, suit ou ouvre un log
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+SM_DIR="$ROOT/.sm"
+
+# === Chargement de la config projet =========================================
+CONFIG_FILE="$SM_DIR/config.sh"
+[[ -f "$CONFIG_FILE" ]] || {
+  echo "❌ $CONFIG_FILE introuvable." >&2
+  echo "   Copie .sm/config.example.sh → .sm/config.sh et adapte-le." >&2
+  exit 1
+}
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+# Valeurs par défaut (si la config ne les définit pas) -------------------------
+PROJECT_NAME="${PROJECT_NAME:-Projet}"
+SM_BASE_BRANCH="${SM_BASE_BRANCH:-develop}"
+SM_PR_TARGET="${SM_PR_TARGET:-$SM_BASE_BRANCH}"
+DEPLOY_CMD="${DEPLOY_CMD:-}"
+IMPL_CLI="${IMPL_CLI:-claude}"
+REVIEW_CLI="${REVIEW_CLI:-agy}"
+PROJECT_STRUCTURE="${PROJECT_STRUCTURE:-Voir CLAUDE.md pour la structure du projet.}"
+AGY_TOKEN_FILE="${AGY_TOKEN_FILE:-}"
+MAX_BODY_BYTES="${MAX_BODY_BYTES:-4096}"
+NOTIFY_SOUND="${NOTIFY_SOUND:-Glass}"
+: "${ALLOWED_AUTHORS:?définis ALLOWED_AUTHORS dans .sm/config.sh}"
+: "${ALLOWED_PATHS_REGEX:?définis ALLOWED_PATHS_REGEX dans .sm/config.sh}"
+SECRET_PATTERNS="${SECRET_PATTERNS:-(sk-[A-Za-z0-9]{20,}|gh[opsu]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[baprs]-[A-Za-z0-9-]{20,}|AIza[0-9A-Za-z_-]{35})}"
+
+NOTIFY="$SM_DIR/notify.sh"
+LOGS_DIR="$SM_DIR/logs"
+mkdir -p "$LOGS_DIR"
+
+# === Snapshot des ressources du framework (hors arbre git) ===================
+# Les branches d'US sont créées depuis $SM_BASE_BRANCH, qui ne porte
+# volontairement PAS le framework (sm, .sm/prompts, .sm/notify.sh, AGY.md). Or
+# `cmd_run` fait un `git checkout $SM_BASE_BRANCH` AVANT de lire ces fichiers :
+# le checkout les retirait de l'arbre et cassait le run en plein milieu. On les
+# fige donc dans un dossier temporaire au démarrage et on lit depuis ce snapshot.
+# (.sm/logs/ est gitignored → survit au checkout, on le laisse dans le repo.)
+SM_ASSETS="$(mktemp -d "${TMPDIR:-/tmp}/sm-assets.XXXXXX")"
+trap 'rm -rf "$SM_ASSETS"' EXIT
+PROMPTS_DIR="$SM_DIR/prompts"
+AGY_MD="$ROOT/AGY.md"
+if [[ -d "$SM_DIR/prompts" ]]; then
+  cp -R "$SM_DIR/prompts" "$SM_ASSETS/prompts"; PROMPTS_DIR="$SM_ASSETS/prompts"
+fi
+if [[ -f "$NOTIFY" ]]; then
+  cp "$NOTIFY" "$SM_ASSETS/notify.sh"; chmod +x "$SM_ASSETS/notify.sh"; NOTIFY="$SM_ASSETS/notify.sh"
+fi
+if [[ -f "$ROOT/AGY.md" ]]; then
+  cp "$ROOT/AGY.md" "$SM_ASSETS/AGY.md"; AGY_MD="$SM_ASSETS/AGY.md"
+fi
+
+# Identité GitHub distincte pour la review (reviewer).
+# GitHub interdit d'approuver formellement sa propre PR : si l'auteur de la PR et
+# le reviewer sont le même compte, --approve est refusé. On fournit donc au
+# reviewer un token d'un compte/identité distincte, via AGY_GH_TOKEN (env) ou un
+# fichier hors du repo (AGY_TOKEN_FILE dans config.sh).
+# Si aucun token n'est trouvé, on retombe sur --comment (pas d'approval formel).
+
+die()  { echo "❌ $*" >&2; exit 1; }
+log()  { echo "→ $*"; }
+slug() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' | cut -c1-40; }
+
+require() { command -v "$1" >/dev/null || die "commande manquante : $1"; }
+
+agy_token() {
+  # Renvoie le token GitHub de l'identité distincte du reviewer, ou rien.
+  if [[ -n "${AGY_GH_TOKEN:-}" ]]; then
+    printf '%s' "$AGY_GH_TOKEN"
+  elif [[ -n "$AGY_TOKEN_FILE" && -f "$AGY_TOKEN_FILE" ]]; then
+    tr -d '[:space:]' < "$AGY_TOKEN_FILE"
+  fi
+}
+
+check_author() {
+  local author="$1"
+  for a in "${ALLOWED_AUTHORS[@]}"; do
+    [[ "$author" == "$a" ]] && return 0
+  done
+  die "Auteur GitHub '$author' non autorisé (whitelist : ${ALLOWED_AUTHORS[*]}). Édite ALLOWED_AUTHORS dans .sm/config.sh."
+}
+
+check_paths() {
+  local bad
+  bad=$(git diff --name-only origin/${SM_BASE_BRANCH}..HEAD | grep -vE "$ALLOWED_PATHS_REGEX" || true)
+  if [[ -n "$bad" ]]; then
+    echo "❌ Fichiers hors allowlist modifiés :" >&2
+    echo "$bad" >&2
+    die "Refus de push. Édite ALLOWED_PATHS_REGEX dans .sm/config.sh si légitime."
+  fi
+}
+
+check_secrets() {
+  if git diff origin/${SM_BASE_BRANCH}..HEAD | grep -E "$SECRET_PATTERNS" >/dev/null; then
+    echo "❌ Secret potentiel détecté dans le diff !" >&2
+    git diff origin/${SM_BASE_BRANCH}..HEAD | grep -nE "$SECRET_PATTERNS" >&2 || true
+    die "Refus de push."
+  fi
+}
+
+confirm_push() {
+  local auto="$1"
+  echo ""
+  echo "=== Diff produit ==="
+  git --no-pager diff --stat origin/${SM_BASE_BRANCH}..HEAD
+  echo ""
+  echo "=== Commits ==="
+  git --no-pager log --oneline origin/${SM_BASE_BRANCH}..HEAD
+  echo ""
+  if [[ "$auto" == "1" ]]; then
+    log "Mode --yes : push automatique"
+    return 0
+  fi
+  read -rp "✅ Push & ouvrir PR ? [y/N] " ans
+  [[ "$ans" =~ ^[yY]$ ]] || die "Abandon — branche locale conservée pour inspection."
+}
+
+audit_comment() {
+  local n="$1" agent="$2" step="$3" body="$4"
+  local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+  gh issue comment "$n" --body "### [$ts] AGENT:$agent STEP:$step
+$body" >/dev/null
+}
+
+route_agent() {
+  case "$1" in
+    *security*|*qa*|*review*) echo "agy" ;;
+    *tech*|*feature*|*bug*|*ui*|*chore*) echo "claude" ;;
+    *) echo "" ;;
+  esac
+}
+
+cmd_setup_labels() {
+  require gh; require jq
+  local file="$ROOT/.github/labels.json"
+  [[ -f "$file" ]] || die "labels.json introuvable"
+  jq -c '.[]' "$file" | while read -r row; do
+    local name color desc
+    name=$(jq -r .name <<<"$row")
+    color=$(jq -r .color <<<"$row")
+    desc=$(jq -r .description <<<"$row")
+    if gh label list --json name -q '.[].name' | grep -qx "$name"; then
+      gh label edit "$name" --color "$color" --description "$desc" >/dev/null
+      echo "  ✏️  $name"
+    else
+      gh label create "$name" --color "$color" --description "$desc" >/dev/null
+      echo "  ➕ $name"
+    fi
+  done
+  echo "✅ Labels synchronisés"
+}
+
+cmd_list() {
+  require gh
+  gh issue list --label "status:ready" --state open
+}
+
+cmd_run() {
+  local ISSUE="" AUTO_YES=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes|-y) AUTO_YES=1; shift ;;
+      *) ISSUE="$1"; shift ;;
+    esac
+  done
+  [[ -n "$ISSUE" ]] || die "usage: ./sm run <issue#> [--yes]"
+  require gh; require jq; require "$IMPL_CLI"
+
+  local data title body labels agent author
+  data=$(gh issue view "$ISSUE" --json title,body,labels,number,author)
+  title=$(jq -r .title <<<"$data")
+  body=$(jq -r .body <<<"$data")
+  labels=$(jq -r '.labels[].name' <<<"$data" | tr '\n' ',')
+  author=$(jq -r .author.login <<<"$data")
+
+  # Garde-fou 1 : whitelist d'auteurs
+  check_author "$author"
+
+  # Garde-fou 2 : tronque le body si trop long (limite la surface d'injection)
+  if (( ${#body} > MAX_BODY_BYTES )); then
+    log "Body de l'issue tronqué de ${#body} à $MAX_BODY_BYTES octets"
+    body="${body:0:$MAX_BODY_BYTES}
+
+[... tronqué pour limiter la surface d'injection ...]"
+  fi
+
+  agent=$(route_agent "$labels")
+  [[ "$agent" == "claude" ]] || die "Issue #$ISSUE non routable vers l'agent Tech (labels: $labels). Attendu: area:tech ou type:feature/bug/chore."
+
+  local branch="us/${ISSUE}-$(slug "$title")"
+
+  log "Sync $SM_BASE_BRANCH & création de la branche $branch"
+  git fetch origin
+  git checkout "$SM_BASE_BRANCH"
+  git pull --ff-only origin "$SM_BASE_BRANCH"
+  git checkout -B "$branch"
+
+  gh issue edit "$ISSUE" --add-label "status:in-progress" --remove-label "status:ready" >/dev/null 2>&1 || true
+  audit_comment "$ISSUE" "sm" "branch-created" "Branche \`$branch\` créée depuis \`$SM_BASE_BRANCH\`."
+
+  log "Assemblage du prompt agent Tech"
+  local prompt
+  prompt=$(sed \
+    -e "s|{{ISSUE}}|$ISSUE|g" \
+    -e "s|{{BRANCH}}|$branch|g" \
+    -e "s|{{PROJECT_NAME}}|${PROJECT_NAME//|/\\|}|g" \
+    -e "s|{{BASE_BRANCH}}|$SM_BASE_BRANCH|g" \
+    -e "s|{{TITLE}}|${title//|/\\|}|g" \
+    "$PROMPTS_DIR/implement.md")
+  prompt="${prompt//\{\{PROJECT_STRUCTURE\}\}/$PROJECT_STRUCTURE}"
+  prompt="${prompt//\{\{CLAUDE_MD\}\}/$(cat CLAUDE.md 2>/dev/null || echo '(pas de CLAUDE.md)')}"
+  prompt="${prompt//\{\{BACKLOG_MD\}\}/$(cat BACKLOG.md 2>/dev/null || echo '(pas de BACKLOG.md)')}"
+  prompt="${prompt//\{\{BODY\}\}/$body}"
+
+  local log_file="$LOGS_DIR/run-${ISSUE}-$(date +%Y%m%d-%H%M%S).log"
+  log "Lancement de l'agent Tech ($IMPL_CLI)…"
+  log "📋 Log : $log_file  (suivi temps réel : ./sm logs --tail)"
+  local summary
+  summary=$("$IMPL_CLI" -p --dangerously-skip-permissions "$prompt" 2>&1 | tee "$log_file" | tail -20)
+  echo "---" >> "$log_file"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] Agent Tech terminé" >> "$log_file"
+
+  # Détecte si l'agent a commit quelque chose
+  if [[ -z "$(git log origin/${SM_BASE_BRANCH}..HEAD --oneline)" ]]; then
+    die "Aucun commit produit par l'agent Tech. Abandon."
+  fi
+
+  # Garde-fou 3 : allowlist des chemins modifiés
+  check_paths
+
+  # Garde-fou 4 : scan secrets dans le diff
+  check_secrets
+
+  # Garde-fou 5 : gate humain (sauf --yes)
+  confirm_push "$AUTO_YES"
+
+  log "Push de la branche"
+  git push -u origin "$branch"
+
+  log "Ouverture de la PR vers $SM_PR_TARGET"
+  local pr_url pr_num
+  pr_url=$(gh pr create \
+    --base "$SM_PR_TARGET" \
+    --head "$branch" \
+    --title "[US-$ISSUE] $title" \
+    --body "Closes #$ISSUE
+
+## Implémenté par
+Agent Tech ($IMPL_CLI) via \`./sm run $ISSUE\`
+
+## Résumé
+$summary
+
+## Recette
+Voir la deploy preview / les checks ci-dessous." \
+    --label "status:in-review")
+  pr_num=$(basename "$pr_url")
+
+  audit_comment "$ISSUE" "claude" "implement" "PR ouverte : $pr_url
+
+\`\`\`
+$summary
+\`\`\`"
+
+  "$NOTIFY" "$PROJECT_NAME — PR ouverte" "US-$ISSUE prête pour review" "$pr_url"
+
+  log "Chaînage automatique → review"
+  cmd_review "$pr_num"
+}
+
+cmd_review() {
+  local PR="${1:-}"; [[ -n "$PR" ]] || die "usage: ./sm review <pr#>"
+  require gh; require jq; require "$REVIEW_CLI"
+
+  local pr_data issue title body diff
+  pr_data=$(gh pr view "$PR" --json title,body,number,headRefName)
+  issue=$(gh pr view "$PR" --json body -q .body | grep -oE 'Closes #[0-9]+' | head -1 | grep -oE '[0-9]+')
+  [[ -n "$issue" ]] || die "Impossible de retrouver l'issue source dans la PR #$PR (cherche 'Closes #N')."
+
+  title=$(gh issue view "$issue" --json title -q .title)
+  body=$(gh issue view "$issue" --json body -q .body)
+  diff=$(gh pr diff "$PR")
+
+  log "Assemblage du prompt reviewer"
+  local prompt
+  prompt=$(sed \
+    -e "s|{{PR}}|$PR|g" \
+    -e "s|{{ISSUE}}|$issue|g" \
+    -e "s|{{PROJECT_NAME}}|${PROJECT_NAME//|/\\|}|g" \
+    -e "s|{{TITLE}}|${title//|/\\|}|g" \
+    "$PROMPTS_DIR/review.md")
+  prompt="${prompt//\{\{AGY_MD\}\}/$(cat "$AGY_MD")}"
+  prompt="${prompt//\{\{BACKLOG_MD\}\}/$(cat BACKLOG.md 2>/dev/null || echo '(pas de BACKLOG.md)')}"
+  prompt="${prompt//\{\{BODY\}\}/$body}"
+  prompt="${prompt//\{\{DIFF\}\}/$diff}"
+
+  local log_file="$LOGS_DIR/review-${PR}-$(date +%Y%m%d-%H%M%S).log"
+  log "Lancement du reviewer ($REVIEW_CLI)…"
+  log "📋 Log : $log_file"
+  local review
+  review=$("$REVIEW_CLI" -p "$prompt" 2>&1 | tee "$log_file")
+  echo "$review"
+  echo "---" >> "$log_file"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] Reviewer terminé" >> "$log_file"
+
+  local verdict="COMMENT"
+  if grep -qE '\*\*APPROVE\*\*'         <<<"$review"; then verdict="APPROVE"; fi
+  if grep -qE '\*\*REQUEST_CHANGES\*\*' <<<"$review"; then verdict="REQUEST_CHANGES"; fi
+
+  log "Verdict : $verdict — publication sur la PR"
+  local action_flag="" review_status="$verdict"
+  case "$verdict" in
+    APPROVE)         action_flag="--approve" ;;
+    REQUEST_CHANGES) action_flag="--request-changes" ;;
+    *)               action_flag="--comment" ;;
+  esac
+
+  local agy_tok posted=0
+  agy_tok="$(agy_token)"
+  if [[ -n "$agy_tok" ]]; then
+    if GH_TOKEN="$agy_tok" gh pr review "$PR" $action_flag --body "$review" 2>/dev/null; then
+      posted=1
+      log "✅ Review publiée sous l'identité distincte du reviewer ($action_flag)"
+    else
+      log "⚠️  Échec sous l'identité reviewer — vérifie le token et les droits (collaborateur)."
+    fi
+  elif gh pr review "$PR" $action_flag --body "$review" 2>/dev/null; then
+    posted=1
+  fi
+
+  if [[ "$posted" -eq 0 ]]; then
+    log "⚠️  Action $action_flag non aboutie — fallback en --comment"
+    local fallback_body="$review
+
+---
+> ℹ️ **Verdict effectif : $verdict** — l'action \`$action_flag\` n'a pas pu être appliquée (auto-review interdite sur sa propre PR, ou token reviewer absent — voir AGY_TOKEN_FILE dans \`.sm/config.sh\`). Approval manuel requis si APPROVE."
+    gh pr review "$PR" --comment --body "$fallback_body"
+    review_status="$verdict (commented, manual approval needed)"
+  fi
+
+  audit_comment "$issue" "agy" "review" "Verdict: **$verdict** sur PR #$PR ($review_status)
+
+$review"
+
+  "$NOTIFY" "$PROJECT_NAME — Review" "PR #$PR : $verdict" "$(gh pr view "$PR" --json url -q .url)"
+}
+
+cmd_promote() {
+  require gh
+  log "Promotion $SM_BASE_BRANCH → main"
+  git fetch origin
+  git checkout main
+  git pull --ff-only origin main
+  git merge --ff-only origin/${SM_BASE_BRANCH} || die "Merge non fast-forward — résous le conflit à la main."
+  git push origin main
+  if [[ -n "$DEPLOY_CMD" ]]; then
+    log "Déploiement production : $DEPLOY_CMD"
+    eval "$DEPLOY_CMD"
+  else
+    log "Pas de DEPLOY_CMD configuré — étape de déploiement ignorée."
+  fi
+  "$NOTIFY" "$PROJECT_NAME — Prod déployée" "main mis à jour depuis $SM_BASE_BRANCH"
+}
+
+cmd_bug() {
+  local SRC="${1:-}" DESC="${*:2}"
+  [[ -n "$SRC" && -n "$DESC" ]] || die "usage: ./sm bug <us#> \"<description>\""
+  local src_title; src_title=$(gh issue view "$SRC" --json title -q .title)
+  local url
+  url=$(gh issue create \
+    --title "[BUG] $DESC (issu de US-$SRC)" \
+    --body "Bug détecté en recette sur la US #$SRC ($src_title).
+
+## Description
+$DESC
+
+## Issue source
+#$SRC" \
+    --label "type:bug,status:ready,priority:high")
+  audit_comment "$SRC" "humain" "bug-reported" "Bug ouvert : $url
+$DESC"
+  echo "🐛 $url"
+}
+
+cmd_status() {
+  local n="${1:-}"; [[ -n "$n" ]] || die "usage: ./sm status <issue#>"
+  gh issue view "$n" --comments
+}
+
+cmd_logs() {
+  local arg="${1:-}"
+  case "$arg" in
+    "")
+      if ! ls "$LOGS_DIR"/*.log >/dev/null 2>&1; then
+        echo "Aucun log dans $LOGS_DIR"
+        return 0
+      fi
+      ls -lht "$LOGS_DIR"/*.log | head -10 | awk '{printf "%s %s %s %5s  %s\n", $6, $7, $8, $5, $NF}'
+      echo ""
+      echo "Pour suivre le run en cours : ./sm logs --tail"
+      echo "Pour ouvrir un log précis   : ./sm logs <issue#> ou <pr#>"
+      ;;
+    --tail|-f)
+      local latest
+      latest=$(ls -t "$LOGS_DIR"/*.log 2>/dev/null | head -1) || die "Aucun log"
+      [[ -n "$latest" ]] || die "Aucun log trouvé"
+      echo "📋 Tail : $latest"
+      tail -f "$latest"
+      ;;
+    *)
+      local matches latest
+      matches=$(ls -t "$LOGS_DIR"/run-${arg}-*.log "$LOGS_DIR"/review-${arg}-*.log 2>/dev/null) || true
+      [[ -n "$matches" ]] || die "Aucun log pour #$arg"
+      latest=$(head -1 <<<"$matches")
+      echo "📋 $latest"
+      ${PAGER:-less} "$latest"
+      ;;
+  esac
+}
+
+# --- entrée ---
+case "${1:-}" in
+  setup-labels) shift; cmd_setup_labels "$@" ;;
+  list)         shift; cmd_list "$@" ;;
+  run)          shift; cmd_run "$@" ;;
+  review)       shift; cmd_review "$@" ;;
+  promote)      shift; cmd_promote "$@" ;;
+  bug)          shift; cmd_bug "$@" ;;
+  status)       shift; cmd_status "$@" ;;
+  logs)         shift; cmd_logs "$@" ;;
+  ""|-h|--help)
+    sed -n '2,22p' "$0"
+    ;;
+  *) die "commande inconnue : $1" ;;
+esac
