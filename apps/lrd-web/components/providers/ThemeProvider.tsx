@@ -13,7 +13,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
   if (!mounted) return <>{children}</>
 
   return (
-    <NextThemesProvider attribute="class" defaultTheme="light" enableSystem>
+    <NextThemesProvider attribute={"class" as any} defaultTheme="light" enableSystem>
       {children}
     </NextThemesProvider>
   )
