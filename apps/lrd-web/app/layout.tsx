@@ -1,12 +1,12 @@
 import type { Metadata } from "next"
 import { Inter, JetBrains_Mono, Calistoga } from "next/font/google"
 import { ThemeProvider } from "@/components/providers/ThemeProvider"
-import "@/styles/globals.css"
+import "./globals.css"
 
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter" })
 const calistoga = Calistoga({
   subsets: ["latin"],
-  weight: ["400", "700"],
+  weight: ["400"],
   variable: "--font-calistoga",
 })
 const jetbrainsMono = JetBrains_Mono({
