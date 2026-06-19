@@ -1,4 +1,5 @@
 import { Code2, Search, Palette, Bot, Globe, TrendingUp, Briefcase } from 'lucide-react'
+import { FadeUp, StaggerGroup, StaggerItem } from '@/components/ui/MotionWrapper'
 
 const services = [
   { icon: Code2, label: 'IT & Freelance', desc: 'Experts IT, dev web, accompagnement freelance', color: '#3B82F6' },
@@ -14,34 +15,35 @@ export function ValueProps() {
   return (
     <section className="py-16 md:py-24">
       <div className="container-fluid">
-        <div className="text-center mb-12">
+        <FadeUp className="text-center mb-12">
           <h2 className="text-3xl md:text-4xl font-bold mb-4" style={{ fontFamily: 'var(--font-heading)' }}>
             Un collectif d'experts du numérique
           </h2>
           <p className="text-lg max-w-2xl mx-auto" style={{ color: 'var(--color-secondary)' }}>
             Chaque demande traitée comme une expérience unique, avec un expert dédié qui accompagne votre projet pas à pas.
           </p>
-        </div>
+        </FadeUp>
 
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+        <StaggerGroup className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
           {services.map((service) => {
             const Icon = service.icon
             return (
-              <div key={service.label}
-                className="p-5 rounded-xl card-hover cursor-pointer"
-                style={{ backgroundColor: 'var(--color-background)', border: '1px solid var(--color-border)' }}
-              >
-                <div className="w-10 h-10 rounded-lg flex items-center justify-center mb-3" style={{ backgroundColor: `${service.color}18` }}>
-                  <Icon size={20} style={{ color: service.color }} />
+              <StaggerItem key={service.label}>
+                <div
+                  className="p-5 rounded-xl card-hover cursor-pointer h-full"
+                  style={{ backgroundColor: 'var(--color-background)', border: '1px solid var(--color-border)' }}
+                >
+                  <div className="w-10 h-10 rounded-lg flex items-center justify-center mb-3" style={{ backgroundColor: `${service.color}18` }}>
+                    <Icon size={20} style={{ color: service.color }} />
+                  </div>
+                  <h3 className="font-semibold text-sm mb-1" style={{ color: 'var(--color-foreground)' }}>{service.label}</h3>
+                  <p className="text-xs leading-relaxed" style={{ color: 'var(--color-secondary)' }}>{service.desc}</p>
                 </div>
-                <h3 className="font-semibold text-sm mb-1" style={{ color: 'var(--color-foreground)' }}>{service.label}</h3>
-                <p className="text-xs leading-relaxed" style={{ color: 'var(--color-secondary)' }}>{service.desc}</p>
-              </div>
+              </StaggerItem>
             )
           })}
-          {/* Empty slot filler for 4-col grid alignment */}
           <div className="hidden lg:block" />
-        </div>
+        </StaggerGroup>
       </div>
     </section>
   )
